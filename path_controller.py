@@ -7,12 +7,15 @@ This Ryu application:
   2. Learns MAC-to-port mappings dynamically
   3. Installs explicit OpenFlow 1.3 match-action flow rules
   4. Logs every forwarding decision (which switch, which port)
-  5. Blocks traffic from h3 (10.0.0.3) — Scenario B demonstration
+  5. Blocks ALL traffic TO h3 (10.0.0.3) — Scenario B
+
+  KEY FIX: Block rule matches on DESTINATION IP (nw_dst=10.0.0.3)
+  and is pre-installed on every switch at startup, so the block
+  takes effect BEFORE any packet_in ever reaches the controller.
+  This guarantees 100% packet loss for Scenario B from the first ping.
 
 Run with:
     ryu-manager controller/path_controller.py
-
-The controller listens on port 6633 by default.
 """
 
 from ryu.base import app_manager
@@ -20,161 +23,156 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ether_types, ipv4, arp
-from ryu.lib import mac as mac_lib
 
 
-# IP of the blocked host (Scenario B — blocked path)
-BLOCKED_IP = '10.0.0.3'
+# ── Block configuration (Scenario B) ────────────────────────────────────────
+# Traffic TO this IP will be dropped by a proactive rule on every switch
+BLOCKED_DST_IP  = '10.0.0.3'
+BLOCKED_DST_MAC = '00:00:00:00:00:03'
 
 # Flow rule priorities
-PRIORITY_BLOCK  = 100   # Highest — drop rules for blocked hosts
-PRIORITY_LEARN  = 10    # Learned unicast forwarding
-PRIORITY_FLOOD  = 1     # Default flood (lowest)
+PRIORITY_BLOCK = 200   # Pre-installed drop rule — highest priority
+PRIORITY_LEARN = 10    # Reactively learned unicast forwarding
+PRIORITY_MISS  = 0     # Table-miss — send unknown packets to controller
 
-# Flow idle timeout in seconds (0 = permanent)
-IDLE_TIMEOUT = 30
+# Flow idle timeout (0 = permanent)
+IDLE_TIMEOUT = 0
 
 
 class PathController(app_manager.RyuApp):
     """
-    A learning switch controller that:
-    - Logs the path packets take through the network
-    - Installs explicit OpenFlow match-action rules
-    - Drops traffic from BLOCKED_IP (Scenario B)
+    Learning switch + proactive block rule controller.
+
+    Scenario A (normal): h1 -> h2 — controller learns MACs, installs
+    unicast forwarding rules. Path tracer shows h1-s1-s2-s3-h2.
+
+    Scenario B (blocked): h1 -> h3 — dropped immediately at every switch
+    because a priority=200 drop rule matching dst=10.0.0.3 is installed
+    at switch-connect time, before any ping is attempted.
     """
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(PathController, self).__init__(*args, **kwargs)
-        # mac_to_port[datapath_id][mac_address] = port_number
         self.mac_to_port = {}
-        self.logger.info("=" * 60)
-        self.logger.info("  SDN Path Tracing Controller started")
-        self.logger.info("  Blocking traffic from: %s (Scenario B)", BLOCKED_IP)
-        self.logger.info("=" * 60)
+        self.logger.info("=" * 62)
+        self.logger.info("  SDN Path Tracing Controller  —  started")
+        self.logger.info("  Scenario B: ALL traffic to %s will be DROPPED", BLOCKED_DST_IP)
+        self.logger.info("  Block rule pre-installed on every switch at connect time")
+        self.logger.info("=" * 62)
 
     # ------------------------------------------------------------------ #
-    #  Switch feature handshake — install a table-miss flow entry         #
+    #  Switch feature handshake                                           #
+    #  Install BOTH the block rule AND the table-miss rule on connect     #
     # ------------------------------------------------------------------ #
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """
-        When a switch connects, install a table-miss rule so that
-        unmatched packets are sent to the controller (packet_in).
-        """
         datapath = ev.msg.datapath
         ofproto  = datapath.ofproto
         parser   = datapath.ofproto_parser
 
-        # Match everything, lowest priority → send to controller
-        match   = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                          ofproto.OFPCML_NO_BUFFER)]
+        # 1. Pre-install drop rule for traffic TO BLOCKED_DST_IP
+        # priority=200 — beats every other rule on this switch
+        block_match = parser.OFPMatch(
+            eth_type=ether_types.ETH_TYPE_IP,
+            ipv4_dst=BLOCKED_DST_IP
+        )
         self._install_flow(datapath,
-                           priority=0,
-                           match=match,
-                           actions=actions,
+                           priority=PRIORITY_BLOCK,
+                           match=block_match,
+                           actions=[],
                            idle_timeout=0)
 
-        self.logger.info("[Switch %016x] Connected — table-miss rule installed",
-                         datapath.id)
+        # Also block ARP requests to h3 so ARP resolution fails too
+        arp_block_match = parser.OFPMatch(
+            eth_type=ether_types.ETH_TYPE_ARP,
+            arp_tpa=BLOCKED_DST_IP
+        )
+        self._install_flow(datapath,
+                           priority=PRIORITY_BLOCK,
+                           match=arp_block_match,
+                           actions=[],
+                           idle_timeout=0)
+
+        # 2. Table-miss rule — send unmatched packets to controller
+        miss_match   = parser.OFPMatch()
+        miss_actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                               ofproto.OFPCML_NO_BUFFER)]
+        self._install_flow(datapath,
+                           priority=PRIORITY_MISS,
+                           match=miss_match,
+                           actions=miss_actions,
+                           idle_timeout=0)
+
+        self.logger.info(
+            "[Switch %016x] Connected — drop(dst=%s) + table-miss installed",
+            datapath.id, BLOCKED_DST_IP
+        )
 
     # ------------------------------------------------------------------ #
-    #  Main packet_in handler                                             #
+    #  packet_in handler — reactive MAC learning & unicast forwarding     #
     # ------------------------------------------------------------------ #
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        """
-        Called every time a switch sends a packet to the controller.
-        We:
-          1. Parse the packet to extract Ethernet src/dst
-          2. Learn the src MAC → port mapping
-          3. Check if the packet should be blocked (Scenario B)
-          4. Install a unicast flow rule if the destination is known
-          5. Forward or flood the current packet
-        """
         msg      = ev.msg
         datapath = msg.datapath
         dpid     = datapath.id
         ofproto  = datapath.ofproto
         parser   = datapath.ofproto_parser
 
-        # Parse the incoming packet
-        pkt      = packet.Packet(msg.data)
-        eth_pkt  = pkt.get_protocol(ethernet.ethernet)
-
+        pkt     = packet.Packet(msg.data)
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
         if eth_pkt is None:
-            return  # Not an Ethernet packet — ignore
+            return
 
-        src_mac  = eth_pkt.src
-        dst_mac  = eth_pkt.dst
-        in_port  = msg.match['in_port']
+        src_mac = eth_pkt.src
+        dst_mac = eth_pkt.dst
+        in_port = msg.match['in_port']
 
-        # Ignore LLDP and IPv6 multicast to reduce noise
         if eth_pkt.ethertype == ether_types.ETH_TYPE_LLDP:
             return
-        if dst_mac.startswith('33:33'):
+
+        # Safety net — drop anything to blocked MAC at software level too
+        if dst_mac == BLOCKED_DST_MAC:
+            self.logger.warning(
+                "[Switch %016x] SAFETY DROP — dst=%s hit controller "
+                "(flow rule may not be active yet)", dpid, dst_mac
+            )
             return
 
-        # ── Step 1: Learn source MAC → port ──────────────────────────── #
+        # MAC learning
         self.mac_to_port.setdefault(dpid, {})
         if self.mac_to_port[dpid].get(src_mac) != in_port:
             self.mac_to_port[dpid][src_mac] = in_port
             self.logger.info(
-                "[Switch %016x] Learned  MAC=%s  port=%d",
+                "[Switch %016x] Learned  MAC=%-18s  port=%d",
                 dpid, src_mac, in_port
             )
 
-        # ── Step 2: Check block rule (Scenario B) ────────────────────── #
-        ip_pkt = pkt.get_protocol(ipv4.ipv4)
-        if ip_pkt and ip_pkt.src == BLOCKED_IP:
-            # Install a high-priority drop rule so future packets are
-            # dropped IN the switch without hitting the controller
-            match = parser.OFPMatch(
-                eth_type=ether_types.ETH_TYPE_IP,
-                ipv4_src=BLOCKED_IP
-            )
-            self._install_flow(datapath,
-                               priority=PRIORITY_BLOCK,
-                               match=match,
-                               actions=[],        # empty actions = DROP
-                               idle_timeout=IDLE_TIMEOUT)
-            self.logger.warning(
-                "[Switch %016x] BLOCKED  src=%s (Scenario B — drop rule installed)",
-                dpid, BLOCKED_IP
-            )
-            return   # Drop this packet now; don't forward
-
-        # ── Step 3: Decide output port ───────────────────────────────── #
+        # Forwarding decision
         if dst_mac in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst_mac]
-
-            # Install a unicast flow rule for future packets
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst_mac)
-            actions = [parser.OFPActionOutput(out_port)]
+            match    = parser.OFPMatch(in_port=in_port, eth_dst=dst_mac)
+            actions  = [parser.OFPActionOutput(out_port)]
             self._install_flow(datapath,
                                priority=PRIORITY_LEARN,
                                match=match,
                                actions=actions,
-                               idle_timeout=IDLE_TIMEOUT)
-
+                               idle_timeout=30)
             self.logger.info(
-                "[Switch %016x] FORWARD  dst=%s  in_port=%d → out_port=%d",
+                "[Switch %016x] FORWARD  dst=%-18s  in=%d → out=%d",
                 dpid, dst_mac, in_port, out_port
             )
         else:
-            # Destination unknown — flood
             out_port = ofproto.OFPP_FLOOD
             self.logger.info(
-                "[Switch %016x] FLOOD    dst=%s  (unknown MAC, flooding)",
+                "[Switch %016x] FLOOD    dst=%-18s  (unknown)",
                 dpid, dst_mac
             )
 
-        # ── Step 4: Send the current packet out ──────────────────────── #
         actions = [parser.OFPActionOutput(out_port)]
         data    = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-
         out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=msg.buffer_id,
@@ -185,32 +183,18 @@ class PathController(app_manager.RyuApp):
         datapath.send_msg(out)
 
     # ------------------------------------------------------------------ #
-    #  Helper: install a flow rule into a switch                          #
+    #  Helper: install a flow rule                                        #
     # ------------------------------------------------------------------ #
-    def _install_flow(self, datapath, priority, match, actions,
-                      idle_timeout=IDLE_TIMEOUT):
-        """
-        Send an OFPFlowMod message to install a flow entry.
-
-        Args:
-            datapath     : the switch datapath object
-            priority     : rule priority (higher wins on conflict)
-            match        : OFPMatch specifying which packets to match
-            actions      : list of OFPAction objects (empty = drop)
-            idle_timeout : remove rule after N seconds of inactivity
-        """
+    def _install_flow(self, datapath, priority, match, actions, idle_timeout=0):
+        """Send OFPFlowMod. Empty actions list = DROP."""
         ofproto = datapath.ofproto
         parser  = datapath.ofproto_parser
-
-        instructions = [
-            parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)
-        ]
-
-        flow_mod = parser.OFPFlowMod(
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod  = parser.OFPFlowMod(
             datapath=datapath,
             priority=priority,
             idle_timeout=idle_timeout,
             match=match,
-            instructions=instructions
+            instructions=inst
         )
-        datapath.send_msg(flow_mod)
+        datapath.send_msg(mod)
